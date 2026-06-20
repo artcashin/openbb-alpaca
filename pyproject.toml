@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openbb-alpaca"
+version = "0.1.0"
+description = "Alpaca provider extension for OpenBB (equity historical pricing)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-only" }
+dependencies = ["openbb-core>=1.5.8"]
+
+# Registers the `alpaca` provider with OpenBB's plugin system.
+[project.entry-points."openbb_provider_extension"]
+alpaca = "openbb_alpaca:alpaca_provider"
+
+[tool.setuptools.packages.find]
+include = ["openbb_alpaca*"]
