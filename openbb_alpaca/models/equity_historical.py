@@ -1,7 +1,5 @@
 """Alpaca Equity Historical Price Model."""
 
-# pylint: disable=unused-argument
-
 from datetime import datetime
 from typing import Any, Literal
 
@@ -14,18 +12,13 @@ from openbb_core.provider.utils.descriptions import QUERY_DESCRIPTIONS
 from openbb_core.provider.utils.errors import EmptyDataError, UnauthorizedError
 from pydantic import Field
 
-# OpenBB interval -> Alpaca timeframe string.
-INTERVAL_MAP = {
-    "1m": "1Min",
-    "5m": "5Min",
-    "15m": "15Min",
-    "30m": "30Min",
-    "1h": "1Hour",
-    "1d": "1Day",
-    "1W": "1Week",
-    "1M": "1Month",
-}
-DAILY_OR_LONGER = {"1d", "1W", "1M"}
+from openbb_alpaca.utils import (
+    ALPACA_MAX_PER_PAGE,
+    DAILY_OR_LONGER,
+    INTERVAL_MAP,
+    paginate_bars,
+)
+
 BASE_URL = "https://data.alpaca.markets/v2/stocks/bars"
 
 
@@ -35,6 +28,9 @@ class AlpacaEquityHistoricalQueryParams(EquityHistoricalQueryParams):
     Source: https://docs.alpaca.markets/reference/stockbars
     """
 
+    # OpenBB core reads this dunder directly (registry_map / package_builder) for
+    # multi-symbol + choices; pydantic's model_config json_schema_extra is a
+    # different mechanism core never inspects, so it must stay this attribute.
     __json_schema_extra__ = {
         "symbol": {"multiple_items_allowed": True},
         "interval": {"choices": list(INTERVAL_MAP)},
@@ -77,6 +73,7 @@ class AlpacaEquityHistoricalFetcher(
     """Transform the query, extract and transform the data from Alpaca endpoints."""
 
     @staticmethod
+    # pylint: disable=unused-argument
     def transform_query(params: dict[str, Any]) -> AlpacaEquityHistoricalQueryParams:
         """Transform the query params; default to a 1-year window."""
         # pylint: disable=import-outside-toplevel
@@ -91,15 +88,13 @@ class AlpacaEquityHistoricalFetcher(
         return AlpacaEquityHistoricalQueryParams(**transformed)
 
     @staticmethod
+    # pylint: disable=unused-argument
     async def aextract_data(
         query: AlpacaEquityHistoricalQueryParams,
         credentials: dict[str, str] | None,
         **kwargs: Any,
     ) -> list[dict]:
         """Return the raw bars from the Alpaca market-data endpoint."""
-        # pylint: disable=import-outside-toplevel
-        from openbb_core.provider.utils.helpers import amake_request
-
         api_key = (credentials or {}).get("alpaca_api_key")
         api_secret = (credentials or {}).get("alpaca_api_secret")
         if not api_key or not api_secret:
@@ -113,7 +108,11 @@ class AlpacaEquityHistoricalFetcher(
             "APCA-API-SECRET-KEY": api_secret,
             "accept": "application/json",
         }
-        symbols = ",".join(s.strip().upper() for s in query.symbol.split(","))
+        raw_symbols = [s.strip().upper() for s in query.symbol.split(",") if s.strip()]
+        if not raw_symbols:
+            raise EmptyDataError("No symbols provided.")
+        symbols = ",".join(raw_symbols)
+
         base_params: dict[str, Any] = {
             "symbols": symbols,
             "timeframe": INTERVAL_MAP[query.interval],
@@ -121,57 +120,35 @@ class AlpacaEquityHistoricalFetcher(
             "end": str(query.end_date),
             "adjustment": query.adjustment,
             "feed": query.feed,
-            "limit": 10000,
+            "limit": ALPACA_MAX_PER_PAGE,
             "sort": "asc",
         }
 
-        results: list[dict] = []
-        page_token: str | None = None
-        # Alpaca paginates via next_page_token; loop until exhausted.
-        while True:
-            params = dict(base_params)
-            if page_token:
-                params["page_token"] = page_token
-            response = await amake_request(
-                BASE_URL, method="GET", headers=headers, params=params, timeout=30
-            )
-            if not isinstance(response, dict):
-                raise EmptyDataError("Unexpected response from Alpaca.")
-            if response.get("message") and not response.get("bars"):
-                raise UnauthorizedError(f"Alpaca: {response['message']}")
-
-            for sym, bars in (response.get("bars") or {}).items():
-                for bar in bars or []:
-                    bar["symbol"] = sym
-                    results.append(bar)
-
-            page_token = response.get("next_page_token")
-            if not page_token:
-                break
-
-        if not results:
-            raise EmptyDataError("The request was returned empty.")
-        return results
+        return await paginate_bars(BASE_URL, headers, base_params)
 
     @staticmethod
+    # pylint: disable=unused-argument
     def transform_data(
         query: AlpacaEquityHistoricalQueryParams,
         data: list[dict],
         **kwargs: Any,
     ) -> list[AlpacaEquityHistoricalData]:
-        """Map Alpaca bar fields to the standard model."""
+        """Map Alpaca bar fields to the standard model (intraday in America/New_York)."""
         # pylint: disable=import-outside-toplevel
         from pandas import to_datetime
-        from pytz import timezone
+        from zoneinfo import ZoneInfo
 
         multiple = "," in query.symbol
         results: list[AlpacaEquityHistoricalData] = []
         for bar in data:
+            ts = bar.get("t")
+            if ts is None:
+                continue
             if query.interval in DAILY_OR_LONGER:
-                bar_date: Any = to_datetime(bar["t"]).date()
+                bar_date: Any = to_datetime(ts).date()
             else:
-                bar_date = to_datetime(bar["t"], utc=True).tz_convert(
-                    timezone("America/New_York")
+                bar_date = to_datetime(ts, utc=True).tz_convert(
+                    ZoneInfo("America/New_York")
                 )
             item = {
                 "date": bar_date,
@@ -186,6 +163,5 @@ class AlpacaEquityHistoricalFetcher(
             if multiple:
                 item["symbol"] = bar.get("symbol")
             results.append(AlpacaEquityHistoricalData.model_validate(item))
-        # Chronological, then by symbol when multiple.
         results.sort(key=lambda r: (str(getattr(r, "symbol", "")), r.date))
         return results

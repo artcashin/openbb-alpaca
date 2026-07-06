@@ -1,7 +1,5 @@
 """Alpaca Crypto Historical Price Model."""
 
-# pylint: disable=unused-argument
-
 from datetime import datetime
 from typing import Any, Literal
 
@@ -14,9 +12,15 @@ from openbb_core.provider.utils.descriptions import QUERY_DESCRIPTIONS
 from openbb_core.provider.utils.errors import EmptyDataError, UnauthorizedError
 from pydantic import Field
 
-from openbb_alpaca.models.equity_historical import DAILY_OR_LONGER, INTERVAL_MAP
+from openbb_alpaca.utils import (
+    ALPACA_MAX_PER_PAGE,
+    DAILY_OR_LONGER,
+    INTERVAL_MAP,
+    paginate_bars,
+)
 
-# Alpaca crypto market data is a separate (free) endpoint; no feed/adjustment.
+# Alpaca crypto market data is a separate (free) endpoint;
+# it only supports USD-quoted pairs (e.g. BTC/USD, not BTC/EUR).
 BASE_URL = "https://data.alpaca.markets/v1beta3/crypto/us/bars"
 _QUOTES = ["USDT", "USDC", "USD", "BTC", "ETH", "EUR", "DAI"]
 
@@ -40,6 +44,9 @@ class AlpacaCryptoHistoricalQueryParams(CryptoHistoricalQueryParams):
     Source: https://docs.alpaca.markets/reference/cryptobars
     """
 
+    # OpenBB core reads this dunder directly (registry_map / package_builder) for
+    # multi-symbol + choices; pydantic's model_config json_schema_extra is a
+    # different mechanism core never inspects, so it must stay this attribute.
     __json_schema_extra__ = {
         "symbol": {"multiple_items_allowed": True},
         "interval": {"choices": list(INTERVAL_MAP)},
@@ -70,6 +77,7 @@ class AlpacaCryptoHistoricalFetcher(
     """Transform the query, extract and transform the data from Alpaca crypto bars."""
 
     @staticmethod
+    # pylint: disable=unused-argument
     def transform_query(params: dict[str, Any]) -> AlpacaCryptoHistoricalQueryParams:
         """Transform the query params; default to a 1-year window."""
         # pylint: disable=import-outside-toplevel
@@ -84,15 +92,13 @@ class AlpacaCryptoHistoricalFetcher(
         return AlpacaCryptoHistoricalQueryParams(**transformed)
 
     @staticmethod
+    # pylint: disable=unused-argument
     async def aextract_data(
         query: AlpacaCryptoHistoricalQueryParams,
         credentials: dict[str, str] | None,
         **kwargs: Any,
     ) -> list[dict]:
         """Return the raw bars from the Alpaca crypto endpoint."""
-        # pylint: disable=import-outside-toplevel
-        from openbb_core.provider.utils.helpers import amake_request
-
         api_key = (credentials or {}).get("alpaca_api_key")
         api_secret = (credentials or {}).get("alpaca_api_secret")
         if not api_key or not api_secret:
@@ -105,44 +111,34 @@ class AlpacaCryptoHistoricalFetcher(
             "APCA-API-SECRET-KEY": api_secret,
             "accept": "application/json",
         }
-        symbols = ",".join(_normalize_symbol(s) for s in query.symbol.split(","))
+        raw_symbols = [
+            _normalize_symbol(s) for s in query.symbol.split(",") if s.strip()
+        ]
+        if not raw_symbols:
+            raise EmptyDataError("No symbols provided.")
+        symbols = ",".join(raw_symbols)
+
         base_params: dict[str, Any] = {
             "symbols": symbols,
             "timeframe": INTERVAL_MAP[query.interval],
             "start": str(query.start_date),
             "end": str(query.end_date),
-            "limit": 10000,
+            "limit": ALPACA_MAX_PER_PAGE,
             "sort": "asc",
         }
 
-        results: list[dict] = []
-        page_token: str | None = None
-        while True:
-            params = dict(base_params)
-            if page_token:
-                params["page_token"] = page_token
-            response = await amake_request(
-                BASE_URL, method="GET", headers=headers, params=params, timeout=30
-            )
-            if not isinstance(response, dict):
-                raise EmptyDataError("Unexpected response from Alpaca.")
-            if response.get("message") and not response.get("bars"):
-                raise UnauthorizedError(f"Alpaca: {response['message']}")
-
-            for sym, bars in (response.get("bars") or {}).items():
-                for bar in bars or []:
-                    bar["symbol"] = sym
-                    results.append(bar)
-
-            page_token = response.get("next_page_token")
-            if not page_token:
-                break
-
-        if not results:
-            raise EmptyDataError("The request was returned empty.")
-        return results
+        return await paginate_bars(
+            BASE_URL,
+            headers,
+            base_params,
+            empty_message=(
+                "Alpaca crypto endpoint only supports USD-quoted pairs "
+                "(e.g. BTC/USD, ETH/USD)."
+            ),
+        )
 
     @staticmethod
+    # pylint: disable=unused-argument
     def transform_data(
         query: AlpacaCryptoHistoricalQueryParams,
         data: list[dict],
@@ -155,10 +151,13 @@ class AlpacaCryptoHistoricalFetcher(
         multiple = "," in query.symbol
         results: list[AlpacaCryptoHistoricalData] = []
         for bar in data:
+            ts = bar.get("t")
+            if ts is None:
+                continue
             if query.interval in DAILY_OR_LONGER:
-                bar_date: Any = to_datetime(bar["t"]).date()
+                bar_date: Any = to_datetime(ts).date()
             else:
-                bar_date = to_datetime(bar["t"], utc=True)  # crypto trades 24/7 UTC
+                bar_date = to_datetime(ts, utc=True)
             item = {
                 "date": bar_date,
                 "open": bar.get("o"),
